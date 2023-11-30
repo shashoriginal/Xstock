@@ -8,7 +8,7 @@ import seaborn as sns
 import datetime
 
 # Streamlit App Title
-st.title('Stock Analysis App')
+st.title('XStock📈: Stock Analysis App')
 
 # Embed TradingView Ticker
 st.components.v1.html(
