@@ -303,8 +303,7 @@ try:
 
 
 
-    # LSTM Data Preprocessing
-    # Required libraries
+    # Import the required libraries
     import numpy as np
     import pandas as pd
     from statsmodels.tsa.arima.model import ARIMA
@@ -312,15 +311,13 @@ try:
     from tensorflow.keras.layers import LSTM, Dense, Dropout
     from tensorflow.keras.optimizers import Adam
     from tensorflow.keras.callbacks import EarlyStopping
-    from tensorflow.keras import backend as K
-    import keras_tuner as kt
-    from sklearn.metrics import mean_squared_error
-    from sklearn.preprocessing import MinMaxScaler
+    from tensorflow.keras.regularizers import l1_l2
+    from sklearn.preprocessing import StandardScaler
     import matplotlib.pyplot as plt
     import streamlit as st
     from itertools import product
+    import keras_tuner as kt
 
-    # ARIMA Grid Search
     def arima_grid_search(data, p_values, d_values, q_values):
         best_score, best_cfg = float("inf"), None
         for p, d, q in product(p_values, d_values, q_values):
@@ -336,68 +333,98 @@ try:
                 continue
         return best_cfg
 
+    # Normalize the 'adjclose' for LSTM and keep 'moving_average' unscaled for ARIMA
+    scaler = StandardScaler()
+    df['scaled_adjclose'] = scaler.fit_transform(df[['adjclose']])
+
+    # Perform ARIMA Grid Search only on 'adjclose' prices
     p_values = [0, 1, 2]
     d_values = [0, 1]
     q_values = [0, 1, 2]
     best_arima_order = arima_grid_search(df['adjclose'], p_values, d_values, q_values)
     arima_model = ARIMA(df['adjclose'], order=best_arima_order).fit()
-    residuals = df['adjclose'] - arima_model.fittedvalues
 
-    # Preprocess residuals for LSTM
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    scaled_residuals = scaler.fit_transform(residuals.values.reshape(-1, 1))
-    window = 60
-    X, y = [], []
-    for i in range(window, len(scaled_residuals)):
-        X.append(scaled_residuals[i-window:i, 0])
-        y.append(scaled_residuals[i, 0])
-    X, y = np.array(X), np.array(y)
-    X = np.reshape(X, (X.shape[0], X.shape[1], 1))
+    # Split the dataset for train and test
+    train_size = int(len(df) * 0.8)
+    train, test = df.iloc[0:train_size], df.iloc[train_size:len(df)]
+    train_scaled, test_scaled = df['scaled_adjclose'].iloc[0:train_size], df['scaled_adjclose'].iloc[train_size:len(df)]
 
-    # Define and train LSTM model with Keras Tuner
+    # LSTM Data Preparation
+    sequence_length = 60
+
+    def create_sequences(data, seq_length):
+        X, y = [], []
+        for i in range(seq_length, len(data)):
+            X.append(data.iloc[i-seq_length:i].values)
+            y.append(data.iloc[i])
+        return np.array(X), np.array(y)
+
+    X_train, y_train = create_sequences(train_scaled, sequence_length)
+    X_test, y_test = create_sequences(test_scaled, sequence_length)
+
+    # Reshape inputs for LSTM [samples, time steps, features]
+    X_train = np.reshape(X_train, (X_train.shape[0], X_train.shape[1], 1))
+    X_test = np.reshape(X_test, (X_test.shape[0], X_test.shape[1], 1))
+
+    # Define LSTM Model with Keras Tuner
     def build_lstm_model(hp):
         model = Sequential()
-        model.add(LSTM(units=hp.Int('units', min_value=30, max_value=100, step=10), 
-                    return_sequences=True, 
-                    input_shape=(X.shape[1], 1)))
-        model.add(Dropout(rate=hp.Float('dropout_1', min_value=0.0, max_value=0.5, step=0.05)))
-        model.add(LSTM(units=hp.Int('units', min_value=30, max_value=100, step=10)))
-        model.add(Dropout(rate=hp.Float('dropout_2', min_value=0.0, max_value=0.5, step=0.05)))
-        model.add(Dense(units=1))
-        model.compile(optimizer=Adam(hp.Float('learning_rate', min_value=1e-4, max_value=1e-2, sampling='LOG')), loss='mean_squared_error')
+        for i in range(hp.Int('num_layers', 1, 3)):
+            model.add(LSTM(units=hp.Int('units_' + str(i), min_value=30, max_value=100, step=10),
+                        return_sequences=i < hp.Int('num_layers', 1, 3) - 1,
+                        input_shape=(X_train.shape[1], 1)))
+            model.add(Dropout(rate=hp.Float('dropout_' + str(i), min_value=0.0, max_value=0.5, step=0.05)))
+        model.add(Dense(units=1, kernel_regularizer=l1_l2(l1=0.01, l2=0.01)))
+        model.compile(optimizer=Adam(hp.Float('learning_rate', min_value=1e-4, max_value=1e-2, sampling='LOG')),
+                    loss='mean_squared_error')
         return model
 
-    tuner = kt.Hyperband(build_lstm_model, objective='val_loss', max_epochs=10, factor=3, directory='my_dir', project_name='keras_lstm')
+    tuner = kt.Hyperband(build_lstm_model,
+                        objective='val_loss',
+                        max_epochs=10,
+                        factor=3,
+                        directory='my_dir',
+                        project_name='keras_lstm')
+
     stop_early = EarlyStopping(monitor='val_loss', patience=5)
-    tuner.search(X, y, epochs=50, validation_split=0.2, callbacks=[stop_early])
+    tuner.search(X_train, y_train, epochs=50, validation_split=0.2, callbacks=[stop_early])
+
     best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
     model = tuner.hypermodel.build(best_hps)
-    model.fit(X, y, epochs=50, validation_split=0.2)
+    model.fit(X_train, y_train, epochs=50, validation_split=0.2, callbacks=[stop_early])
 
-    # Making final predictions
-    forecast_days = 25
-    arima_predictions = arima_model.predict(start=len(df), end=len(df) + forecast_days - 1)
-    lstm_predictions = model.predict(X)
-    lstm_predictions = scaler.inverse_transform(lstm_predictions)
-    final_predictions = arima_predictions.values
+    # Making Predictions
+    # Predict on the test set
+    test_predictions_lstm = model.predict(X_test)
+    test_predictions_lstm = scaler.inverse_transform(test_predictions_lstm).flatten()
 
-    # Displaying the prediction for the next 25 days
-    st.write("Predicted Stock Prices for the Next 25 Days:")
-    predicted_dates = pd.date_range(start=df.index[-1] + pd.Timedelta(days=1), periods=forecast_days)
-    predictions_df = pd.DataFrame(data=final_predictions, index=predicted_dates, columns=['Predicted Prices'])
-    st.dataframe(predictions_df)
+    # ARIMA predictions for the test set
+    arima_predictions = arima_model.predict(start=train_size, end=len(df)-1)
+    arima_predictions = arima_predictions.iloc[:len(test_predictions_lstm)].to_numpy()
 
-    # Plotting
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(df.index, df['adjclose'], label='Historical Prices', color='blue')
-    ax.plot(predicted_dates, final_predictions, label='Predicted Prices', color='red', linestyle='dashed')
-    ax.set_title('Stock Price Prediction for the Next 25 Days')
-    ax.set_xlabel('Date')
-    ax.set_ylabel('Stock Price ($)')
-    ax.legend()
+    # Ensemble Predictions (Simple averaging in this case for test set)
+    ensemble_predictions = (arima_predictions + test_predictions_lstm) / 2
+
+    # Plotting the Predictions including the test set
+    plt.figure(figsize=(14,7))
+    plt.plot(df.index[:train_size], df['adjclose'][:train_size], label='Training Data')
+    plt.plot(df.index[train_size:train_size+len(ensemble_predictions)], ensemble_predictions, label='Ensemble Test Predictions', color='orange')
+    plt.plot(df.index[train_size:], df['adjclose'][train_size:], label='Actual Prices', color='green')
+    plt.title('Stock Price Prediction including Test Set')
+    plt.xlabel('Date')
+    plt.ylabel('Price')
+    plt.legend()
     plt.xticks(rotation=45)
     plt.tight_layout()
-    st.pyplot(fig)
+    plt.show()
+
+    # Streamlit Display
+    st.write("Stock Price Prediction including Test Set:")
+    predicted_dates = pd.date_range(start=df.index[train_size], periods=len(test_predictions_lstm), freq='B')
+    predictions_df = pd.DataFrame(data=ensemble_predictions, index=predicted_dates, columns=['Ensemble Predicted Prices'])
+    st.line_chart(predictions_df)
+    st.pyplot(plt)
+
 
 except Exception as e:
     st.error(f"Error in computational analysis or visualization: {e}")
