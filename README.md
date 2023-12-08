@@ -15,7 +15,7 @@ Welcome to **XStock**, where data meets design to empower your investment journe
 
 ## 🚀 Quick Start
 
-Begin your data-driven investment journey with [XStock Live](https://xstock.streamlit.app/)! Please note: the platform may occasionally be under maintenance, and maybe unstable. 
+Begin your data-driven investment analysis journey with [XStock Live](https://xstock.streamlit.app/)! Please note: the platform may occasionally be under maintenance, and maybe unstable. 
 
 ## 📘 Step-by-Step Guide
 
