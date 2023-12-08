@@ -9,3 +9,4 @@ datetime
 statsmodels
 tensorflow
 keras_tuner
+scikit-learn
